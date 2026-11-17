@@ -1,0 +1,9 @@
+services:
+  modubot-tts:
+    build: .
+    container_name: modubot-tts
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./logs:/app/logs

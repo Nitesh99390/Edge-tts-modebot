@@ -1,0 +1,22 @@
+# Template systemd unit file (setup_oracle.sh generates and installs this automatically)
+[Unit]
+Description=ModuBot Telegram TTS Novel Bot (Oracle Cloud Edition)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/Edge-tts-modebot
+Environment="PYTHONUNBUFFERED=1"
+EnvironmentFile=/home/ubuntu/Edge-tts-modebot/.env
+ExecStart=/home/ubuntu/Edge-tts-modebot/.venv/bin/python /home/ubuntu/Edge-tts-modebot/bot.py
+Restart=always
+RestartSec=8
+TimeoutStopSec=30
+KillSignal=SIGINT
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

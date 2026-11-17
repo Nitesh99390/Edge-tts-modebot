@@ -1,4 +1,5 @@
-python-telegram-bot==22.8
-python-dotenv==1.2.3
-edge-tts
-beautifulsoup4
+python-telegram-bot>=21.6,<23.0
+python-dotenv>=1.0.1
+edge-tts>=7.0.0
+beautifulsoup4>=4.12.3
+lxml>=5.2.0
