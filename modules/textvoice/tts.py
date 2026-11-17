@@ -1,12 +1,19 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+import re
 import time
 from pathlib import Path
 
 import edge_tts
 
+logger = logging.getLogger(__name__)
 
+# Every voice ID below has been verified live against Microsoft Edge TTS.
+# Note: Microsoft discontinued non-existent voices like hi-IN-AaravNeural,
+# hi-IN-AnanyaNeural, etc., and renamed en-AU-WilliamNeural -> en-AU-WilliamMultilingualNeural.
+# Multilingual Neural voices speak both Devanagari Hindi and Hinglish/English seamlessly!
 LANGUAGES = {
     "en": {
         "label": "🇬🇧 English",
@@ -19,27 +26,28 @@ LANGUAGES = {
             "en-US-MichelleNeural": "👩 Michelle — US",
             "en-US-RogerNeural": "👨 Roger — US",
             "en-US-SteffanNeural": "👨 Steffan — US",
+            "en-US-AndrewMultilingualNeural": "👨 Andrew — US (Warm)",
+            "en-US-AvaMultilingualNeural": "👩 Ava — US (Expressive)",
             "en-IN-NeerjaNeural": "👩 Neerja — India",
+            "en-IN-NeerjaExpressiveNeural": "👩 Neerja Expressive — India",
             "en-IN-PrabhatNeural": "👨 Prabhat — India",
             "en-GB-SoniaNeural": "👩 Sonia — UK",
             "en-GB-RyanNeural": "👨 Ryan — UK",
             "en-AU-NatashaNeural": "👩 Natasha — Australia",
-            "en-AU-WilliamNeural": "👨 William — Australia",
+            "en-AU-WilliamMultilingualNeural": "👨 William — Australia",
         },
     },
-
     "hi": {
-        "label": "🇮🇳 Hindi",
+        "label": "🇮🇳 Hindi / Hinglish",
         "voices": {
-            "hi-IN-AaravNeural": "👨 Aarav",
-            "hi-IN-AnanyaNeural": "👩 Ananya",
-            "hi-IN-AartiNeural": "👩 Aarti",
-            "hi-IN-ArjunNeural": "👨 Arjun",
-            "hi-IN-KavyaNeural": "👩 Kavya",
-            "hi-IN-KunalNeural": "👨 Kunal",
-            "hi-IN-RehaanNeural": "👨 Rehaan",
-            "hi-IN-SwaraNeural": "👩 Swara",
-            "hi-IN-MadhurNeural": "👨 Madhur",
+            "hi-IN-SwaraNeural": "👩 Swara — Hindi (Native)",
+            "hi-IN-MadhurNeural": "👨 Madhur — Hindi (Native)",
+            "en-US-AndrewMultilingualNeural": "👨 Andrew — Multilingual (Hindi+Eng)",
+            "en-US-AvaMultilingualNeural": "👩 Ava — Multilingual (Hindi+Eng)",
+            "en-US-BrianMultilingualNeural": "👨 Brian — Multilingual (Hindi+Eng)",
+            "en-US-EmmaMultilingualNeural": "👩 Emma — Multilingual (Hindi+Eng)",
+            "fr-FR-RemyMultilingualNeural": "👨 Remy — Multilingual (Deep)",
+            "fr-FR-VivienneMultilingualNeural": "👩 Vivienne — Multilingual (Soft)",
         },
     },
 }
@@ -81,6 +89,7 @@ STYLES = {
 
 # Keys are edge-tts rate offsets in percent (-15 means 0.85x).
 SPEEDS = {
+    -25: "0.75×",
     -15: "0.85×",
     -10: "0.90×",
     -5: "0.95×",
@@ -88,19 +97,27 @@ SPEEDS = {
     5: "1.05×",
     10: "1.10×",
     15: "1.15×",
+    25: "1.25×",
+    50: "1.50×",
 }
 
 
 # Retries for transient Edge TTS failures (network drops, websocket errors).
-TTS_ATTEMPTS = 3
-TTS_RETRY_DELAY_SECONDS = 2
+TTS_ATTEMPTS = 4
+TTS_RETRY_DELAY_SECONDS = 2.0
+TTS_CHUNK_TIMEOUT_SECONDS = 90.0
+
+# Match control chars disallowed in XML/SSML (except \t, \n, \r)
+_CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+# Check if chunk actually contains at least one speakable letter or digit
+_SPEAKABLE = re.compile(r"[\w\u0900-\u097F]", flags=re.UNICODE)
 
 
 def get_languages():
     return LANGUAGES
 
 
-def get_voices(language):
+def get_voices(language: str):
     return LANGUAGES[language]["voices"]
 
 
@@ -112,6 +129,21 @@ def get_speeds():
     return SPEEDS
 
 
+def has_speakable_content(text: str) -> bool:
+    """Return True if text has at least one alphanumeric or Devanagari character."""
+    if not text:
+        return False
+    return _SPEAKABLE.search(text) is not None
+
+
+def sanitize_tts_text(text: str) -> str:
+    """Strip invisible control characters that break Edge TTS SSML payloads."""
+    if not text:
+        return ""
+    cleaned = _CONTROL_CHARS.sub(" ", text)
+    return cleaned.strip()
+
+
 def _format_rate(rate) -> str:
     """
     edge-tts expects rate as a string such as:
@@ -119,23 +151,27 @@ def _format_rate(rate) -> str:
         '-3%'
         '+15%'
     """
-    if isinstance(rate, str):
-        rate = rate.strip()
-
-        if rate.endswith("%"):
-            return rate
-
-        try:
-            value = int(float(rate))
-            return f"{value:+d}%"
-        except ValueError:
-            raise TypeError(f"Invalid rate value: {rate!r}")
-
-    try:
-        value = int(rate)
-    except (TypeError, ValueError):
+    if isinstance(rate, bool):
         raise TypeError(f"Invalid rate value: {rate!r}")
 
+    if isinstance(rate, str):
+        cleaned = rate.strip()
+        if cleaned.endswith("%"):
+            num_part = cleaned[:-1].strip()
+        else:
+            num_part = cleaned
+
+        try:
+            value = int(round(float(num_part)))
+        except ValueError as exc:
+            raise TypeError(f"Invalid rate value: {rate!r}") from exc
+    else:
+        try:
+            value = int(round(float(rate)))
+        except (TypeError, ValueError) as exc:
+            raise TypeError(f"Invalid rate value: {rate!r}") from exc
+
+    value = max(-90, min(100, value))
     return f"{value:+d}%"
 
 
@@ -146,92 +182,174 @@ def _format_pitch(pitch) -> str:
         '+1Hz'
         '-2Hz'
     """
-    if isinstance(pitch, str):
-        pitch = pitch.strip()
-
-        if pitch.lower().endswith("hz"):
-            return pitch
-
-        try:
-            value = int(float(pitch))
-            return f"{value:+d}Hz"
-        except ValueError:
-            raise TypeError(f"Invalid pitch value: {pitch!r}")
-
-    try:
-        value = int(pitch)
-    except (TypeError, ValueError):
+    if isinstance(pitch, bool):
         raise TypeError(f"Invalid pitch value: {pitch!r}")
 
+    if isinstance(pitch, str):
+        cleaned = pitch.strip()
+        if cleaned.lower().endswith("hz"):
+            num_part = cleaned[:-2].strip()
+        else:
+            num_part = cleaned
+
+        try:
+            value = int(round(float(num_part)))
+        except ValueError as exc:
+            raise TypeError(f"Invalid pitch value: {pitch!r}") from exc
+    else:
+        try:
+            value = int(round(float(pitch)))
+        except (TypeError, ValueError) as exc:
+            raise TypeError(f"Invalid pitch value: {pitch!r}") from exc
+
+    value = max(-50, min(50, value))
     return f"{value:+d}Hz"
 
 
 async def synthesize(
     text: str,
-    output_path,
+    output_path: str | Path,
     voice: str,
     rate=0,
     pitch=0,
-):
-    if not text or not text.strip():
+    timeout: float = TTS_CHUNK_TIMEOUT_SECONDS,
+) -> bool:
+    """
+    Synthesize text to output_path asynchronously.
+    Returns True if audio was written, False if text had no speakable content.
+    """
+    cleaned = sanitize_tts_text(text)
+    if not cleaned:
         raise ValueError("Cannot synthesize empty text.")
+
+    if not has_speakable_content(cleaned):
+        logger.debug("Skipping non-speakable chunk: %r", cleaned[:60])
+        return False
 
     rate_string = _format_rate(rate)
     pitch_string = _format_pitch(pitch)
+    out = Path(output_path)
 
     communicate = edge_tts.Communicate(
-        text=text,
+        text=cleaned,
         voice=voice,
         rate=rate_string,
         pitch=pitch_string,
     )
 
-    await communicate.save(str(output_path))
+    await asyncio.wait_for(communicate.save(str(out)), timeout=timeout)
+    return True
+
+
+async def synthesize_with_retry(
+    text: str,
+    output_path: str | Path,
+    voice: str,
+    rate=0,
+    pitch=0,
+    attempts: int = TTS_ATTEMPTS,
+) -> bool:
+    """
+    Async native Edge TTS synthesis with exponential backoff & timeout.
+    Does not spawn extra event loops (zero thread overhead on Oracle Cloud).
+    Returns True if audio file was created, False if chunk was non-speakable.
+    """
+    cleaned = sanitize_tts_text(text)
+    if not cleaned:
+        raise ValueError("Cannot synthesize empty text.")
+
+    if not has_speakable_content(cleaned):
+        return False
+
+    output_path = Path(output_path)
+    last_error: Exception | None = None
+
+    for attempt in range(1, attempts + 1):
+        try:
+            wrote = await synthesize(
+                text=cleaned,
+                output_path=output_path,
+                voice=voice,
+                rate=rate,
+                pitch=pitch,
+            )
+            if not wrote:
+                return False
+
+            if output_path.exists() and output_path.stat().st_size > 0:
+                return True
+
+            last_error = RuntimeError("Edge TTS returned empty audio file.")
+
+        except asyncio.CancelledError:
+            output_path.unlink(missing_ok=True)
+            raise
+
+        except (ValueError, TypeError):
+            output_path.unlink(missing_ok=True)
+            raise
+
+        except Exception as exc:
+            last_error = exc
+            logger.warning(
+                "Edge TTS attempt %d/%d failed (%s): %s",
+                attempt,
+                attempts,
+                voice,
+                exc,
+            )
+
+        output_path.unlink(missing_ok=True)
+
+        if attempt < attempts:
+            await asyncio.sleep(TTS_RETRY_DELAY_SECONDS * attempt)
+
+    raise RuntimeError(
+        f"Text-to-speech failed after {attempts} attempts: {last_error}"
+    ) from last_error
 
 
 def synthesize_sync(
     text: str,
-    output_path,
+    output_path: str | Path,
     voice: str,
     rate=0,
     pitch=0,
-):
+) -> bool:
     """
-    Blocking wrapper around synthesize(), with retries.
-
-    Call it from a worker thread (asyncio.to_thread). It uses asyncio.run(),
-    so it must not be called from inside a running event loop.
+    Blocking wrapper around synthesize_with_retry() for backward compatibility.
+    Must be called from outside an active event loop (e.g. worker thread).
     """
     output_path = Path(output_path)
     last_error: Exception | None = None
+
+    cleaned = sanitize_tts_text(text)
+    if not cleaned:
+        raise ValueError("Cannot synthesize empty text.")
+    if not has_speakable_content(cleaned):
+        return False
 
     for attempt in range(1, TTS_ATTEMPTS + 1):
         try:
             asyncio.run(
                 synthesize(
-                    text=text,
+                    text=cleaned,
                     output_path=output_path,
                     voice=voice,
                     rate=rate,
                     pitch=pitch,
                 )
             )
-
             if output_path.exists() and output_path.stat().st_size > 0:
-                return
-
+                return True
             last_error = RuntimeError("Edge TTS returned no audio.")
-
         except (ValueError, TypeError):
-            # Bad input (empty text, invalid rate or pitch). Retrying cannot help.
+            output_path.unlink(missing_ok=True)
             raise
-
         except Exception as exc:
-            # Network drops, websocket errors and service-side rejections are often temporary.
             last_error = exc
 
         output_path.unlink(missing_ok=True)
-
         if attempt < TTS_ATTEMPTS:
             time.sleep(TTS_RETRY_DELAY_SECONDS * attempt)
 

@@ -1,8 +1,12 @@
 .env
 .venv/
+venv/
 __pycache__/
 *.py[cod]
+.pytest_cache/
 temp/
+logs/
 *.mp3
 *.wav
 *.log
+*.zip
