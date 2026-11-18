@@ -13,12 +13,10 @@ from bs4 import BeautifulSoup, FeatureNotFound
 
 logger = logging.getLogger(__name__)
 
-# Zip bomb / resource limits for Oracle Cloud VMs
-MAX_EPUB_UNCOMPRESSED_BYTES = 150 * 1024 * 1024  # 150 MB total text/assets
-MAX_CHAPTER_RAW_BYTES = 15 * 1024 * 1024         # 15 MB per XHTML spine item
-MAX_TXT_BYTES = 50 * 1024 * 1024                 # 50 MB plain text file
+MAX_EPUB_UNCOMPRESSED_BYTES = 150 * 1024 * 1024
+MAX_CHAPTER_RAW_BYTES = 15 * 1024 * 1024
+MAX_TXT_BYTES = 50 * 1024 * 1024
 
-# Recognizes English, Hindi (अध्याय / भाग / खंड), Hinglish, Roman numerals, Prologues & Epilogues
 _TXT_CHAPTER_PATTERN = re.compile(
     r"(?im)^[ \t]*(?:"
     r"(?:chapter|chap\.?|ch\.?|part|book|volume|vol\.?|act|section|episode)\s+"
@@ -41,12 +39,10 @@ class Chapter:
 
 
 def _local_name(tag: str) -> str:
-    """Return XML tag name without its namespace."""
     return tag.rsplit("}", 1)[-1]
 
 
 def _make_soup(raw_bytes: bytes) -> BeautifulSoup:
-    """Use fast C-based lxml parser when installed, falling back to html.parser."""
     try:
         return BeautifulSoup(raw_bytes, "lxml")
     except FeatureNotFound:
@@ -54,19 +50,14 @@ def _make_soup(raw_bytes: bytes) -> BeautifulSoup:
 
 
 def _clean_text(text: str) -> str:
-    """Clean extracted book text without destroying paragraph structure."""
     text = text.replace("\xa0", " ").replace("\u200b", "")
     text = text.replace("\r\n", "\n").replace("\r", "\n")
 
-    lines = []
-    for line in text.splitlines():
-        line = re.sub(r"[ \t]+", " ", line).strip()
-        lines.append(line)
-
-    cleaned = []
+    cleaned: list[str] = []
     previous_blank = False
 
-    for line in lines:
+    for raw_line in text.splitlines():
+        line = re.sub(r"[ \t]+", " ", raw_line).strip()
         if not line:
             if not previous_blank:
                 cleaned.append("")
@@ -81,22 +72,18 @@ def _clean_text(text: str) -> str:
 def _safe_zip_read(zf: zipfile.ZipFile, name: str, max_bytes: int = MAX_CHAPTER_RAW_BYTES) -> bytes:
     info = zf.getinfo(name)
     if info.file_size > max_bytes:
-        raise ValueError(
-            f"Archive entry {name!r} is too large ({info.file_size} bytes)."
-        )
+        raise ValueError(f"EPUB entry {name!r} exceeds size limit.")
     return zf.read(name)
 
 
 def _read_xml(zf: zipfile.ZipFile, name: str) -> ET.Element:
     data = _safe_zip_read(zf, name)
-    # Strip UTF-8 BOM if present before XML parsing
     if data.startswith(b"\xef\xbb\xbf"):
         data = data[3:]
     return ET.fromstring(data)
 
 
 def _find_opf(zf: zipfile.ZipFile) -> str:
-    """Find the EPUB OPF file using META-INF/container.xml (or fallback scan)."""
     names = set(zf.namelist())
     lower_map = {n.lower(): n for n in names}
 
@@ -113,87 +100,61 @@ def _find_opf(zf: zipfile.ZipFile) -> str:
                     if norm.lower() in lower_map:
                         return lower_map[norm.lower()]
 
-    # Fallback: locate any .opf file in the archive
     for name in zf.namelist():
         if name.lower().endswith(".opf"):
             return name
 
-    raise ValueError("Invalid EPUB: could not locate the OPF package file.")
+    raise ValueError("Invalid EPUB: could not locate OPF package file.")
 
 
 def _parse_opf(zf: zipfile.ZipFile, opf_path: str):
-    """
-    Read the EPUB manifest and spine.
-
-    Returns:
-        manifest: {item_id: {href, media_type, properties}}
-        spine: [item_id, ...]
-        toc_id: optional NCX item id
-    """
     opf = _read_xml(zf, opf_path)
-
     manifest: dict[str, dict[str, str]] = {}
-    spine: list[str] = []
+    spine: list[tuple[str, bool]] = []
     toc_id: str | None = None
 
     for element in opf.iter():
         name = _local_name(element.tag)
-
         if name == "spine":
             toc_id = element.attrib.get("toc")
-
         elif name == "item":
             item_id = element.attrib.get("id")
             href = element.attrib.get("href")
-            media_type = element.attrib.get("media-type", "")
-            properties = element.attrib.get("properties", "")
-
             if item_id and href:
                 manifest[item_id] = {
                     "href": href,
-                    "media_type": media_type,
-                    "properties": properties,
+                    "media_type": element.attrib.get("media-type", ""),
+                    "properties": element.attrib.get("properties", ""),
                 }
-
         elif name == "itemref":
-            # Skip non-linear auxiliary items only if marked linear="no" and spine has main items
             idref = element.attrib.get("idref")
             linear = element.attrib.get("linear", "yes").strip().lower()
             if idref:
                 spine.append((idref, linear != "no"))
 
-    # Prefer linear items; if all were marked non-linear, keep all
     linear_spine = [idref for idref, is_linear in spine if is_linear]
-    final_spine = linear_spine if linear_spine else [idref for idref, _ in spine]
-
-    return manifest, final_spine, toc_id
+    return manifest, (linear_spine or [idref for idref, _ in spine]), toc_id
 
 
 def _resolve_href(href: str, base_dir: str, names: set[str], lower_names: dict[str, str]) -> str | None:
-    """
-    Map a manifest/TOC href to a file name inside the EPUB zip.
-    Handles URL-encoding, #fragments, leading slashes, and relative '../' paths.
-    """
     href = href.split("#", 1)[0].strip()
     if not href:
         return None
 
     for candidate in (href, unquote(href)):
-        candidate_clean = candidate.replace("\\", "/")
-        if candidate_clean.startswith("/"):
-            joined = posixpath.normpath(candidate_clean.lstrip("/"))
+        clean = candidate.replace("\\", "/")
+        if clean.startswith("/"):
+            joined = posixpath.normpath(clean.lstrip("/"))
         elif base_dir:
-            joined = posixpath.normpath(posixpath.join(base_dir, candidate_clean))
+            joined = posixpath.normpath(posixpath.join(base_dir, clean))
         else:
-            joined = posixpath.normpath(candidate_clean)
+            joined = posixpath.normpath(clean)
 
         joined = joined.lstrip("/")
         if joined.startswith(".."):
             continue
-
         if joined in names:
             return joined
-
         if joined.lower() in lower_names:
             return lower_names[joined.lower()]
 
@@ -208,16 +169,10 @@ def _parse_toc_titles(
     names: set[str],
     lower_names: dict[str, str],
 ) -> dict[str, str]:
-    """
-    Extract human-readable chapter titles from EPUB3 nav document or EPUB2 toc.ncx.
-    Returns mapping {zip_internal_path: chapter_title}.
-    """
     titles: dict[str, str] = {}
 
-    # 1. EPUB 3 Navigation Document (properties contains "nav")
     for item in manifest.values():
-        props = item.get("properties", "").split()
-        if "nav" in props:
+        if "nav" in item.get("properties", "").split():
             nav_path = _resolve_href(item["href"], opf_dir, names, lower_names)
             if not nav_path:
                 continue
@@ -229,10 +184,9 @@ def _parse_toc_titles(
                     target = _resolve_href(link["href"], nav_dir, names, lower_names)
                     if target and label and target not in titles:
                         titles[target] = label
-            except Exception as exc:
-                logger.debug("Could not parse EPUB3 nav %s: %s", nav_path, exc)
+            except Exception:
+                pass
 
-    # 2. EPUB 2 NCX Table of Contents
     ncx_item = manifest.get(toc_id) if toc_id else None
     if not ncx_item:
         for item in manifest.values():
@@ -249,8 +203,7 @@ def _parse_toc_titles(
                 for nav_point in ncx_root.iter():
                     if _local_name(nav_point.tag) != "navPoint":
                         continue
-                    label_text = ""
-                    content_src = ""
+                    label_text, content_src = "", ""
                     for child in nav_point:
                         cname = _local_name(child.tag)
                         if cname == "navLabel":
@@ -264,17 +217,13 @@ def _parse_toc_titles(
                         target = _resolve_href(content_src, ncx_dir, names, lower_names)
                         if target and target not in titles:
                             titles[target] = label_text
-            except Exception as exc:
-                logger.debug("Could not parse EPUB2 NCX %s: %s", ncx_path, exc)
+            except Exception:
+                pass
 
     return titles
 
 
 def _extract_title(soup: BeautifulSoup, toc_title: str | None, fallback: str) -> str:
-    """
-    Get a useful chapter title.
-    Priority: visible h1-h4 heading -> TOC title -> <title> (if meaningful) -> fallback.
-    """
     for tag_name in ("h1", "h2", "h3", "h4"):
         heading = soup.find(tag_name)
         if heading:
@@ -294,67 +243,23 @@ def _extract_title(soup: BeautifulSoup, toc_title: str | None, fallback: str) ->
 
 
 def _extract_html_text(raw_html: bytes, toc_title: str | None, fallback_title: str) -> tuple[str, str]:
-    """
-    Extract readable text from one XHTML/HTML chapter.
-    Note: We intentionally DO NOT decompose <header> because EPUB3 novels wrap
-    chapter titles inside <header><h1>Chapter 1</h1></header>!
-    """
     soup = _make_soup(raw_html)
 
-    for tag in soup.find_all(
-        [
-            "script",
-            "style",
-            "noscript",
-            "svg",
-            "math",
-            "nav",
-            "footer",
-            "form",
-            "button",
-            "rt",
-            "rp",
-        ]
-    ):
+    for tag in soup.find_all(["script", "style", "noscript", "svg", "math", "nav", "footer", "form", "button", "rt", "rp"]):
         tag.decompose()
 
-    # Also skip EPUB3 navigation blocks hidden inside regular chapters
     for nav_aside in soup.find_all(attrs={"epub:type": re.compile(r"\b(toc|page-list|landmarks)\b")}):
         nav_aside.decompose()
 
     title = _extract_title(soup, toc_title, fallback_title)
-
     body = soup.body if soup.body else soup
 
     for tag in body.find_all(
         [
-            "p",
-            "div",
-            "section",
-            "article",
-            "blockquote",
-            "li",
-            "br",
-            "h1",
-            "h2",
-            "h3",
-            "h4",
-            "h5",
-            "h6",
-            "ul",
-            "ol",
-            "dl",
-            "dt",
-            "dd",
-            "table",
-            "tr",
-            "td",
-            "th",
-            "caption",
-            "figure",
-            "figcaption",
-            "pre",
-            "hr",
+            "p", "div", "section", "article", "blockquote", "li", "br",
+            "h1", "h2", "h3", "h4", "h5", "h6",
+            "ul", "ol", "dl", "dt", "dd",
+            "table", "tr", "td", "th", "caption", "figure", "figcaption", "pre", "hr",
         ]
     ):
         if tag.name == "br":
@@ -363,26 +268,16 @@ def _extract_html_text(raw_html: bytes, toc_title: str | None, fallback_title: s
             tag.insert_before("\n")
             tag.insert_after("\n")
 
-    text = body.get_text()
-    text = _clean_text(text)
-
-    return title, text
+    return title, _clean_text(body.get_text())
 
 
 def _read_text_file(path: Path) -> str:
-    """
-    Decode a TXT file safely. Handles UTF-8 (with or without BOM), UTF-16 LE/BE,
-    UTF-32, Windows-1252, and Latin-1.
-    """
-    size = path.stat().st_size
-    if size > MAX_TXT_BYTES:
+    if path.stat().st_size > MAX_TXT_BYTES:
         raise ValueError("TXT file is too large (over 50 MB).")
 
     data = path.read_bytes()
-
     if data.startswith((b"\xff\xfe\x00\x00", b"\x00\x00\xfe\xff")):
         return data.decode("utf-32", errors="replace")
-
     if data.startswith((b"\xff\xfe", b"\xfe\xff")):
         return data.decode("utf-16", errors="replace")
 
@@ -395,110 +290,70 @@ def _read_text_file(path: Path) -> str:
     return data.decode("utf-8", errors="replace")
 
 
-def extract_epub(path: str | Path, progress_callback=None) -> list[Chapter]:
-    """
-    Extract chapters from an EPUB safely and accurately.
-    """
+def extract_epub(path: str | Path) -> list[Chapter]:
     path = Path(path)
-
     if not path.exists():
         raise FileNotFoundError("EPUB file does not exist.")
-
     if not zipfile.is_zipfile(path):
         raise ValueError("The supplied file is not a valid EPUB archive.")
 
     with zipfile.ZipFile(path, "r") as zf:
-        total_uncompressed = sum(info.file_size for info in zf.infolist())
-        if total_uncompressed > MAX_EPUB_UNCOMPRESSED_BYTES * 3:
-            raise ValueError(
-                "EPUB archive uncompressed size exceeds safety limits."
-            )
+        if sum(info.file_size for info in zf.infolist()) > MAX_EPUB_UNCOMPRESSED_BYTES * 3:
+            raise ValueError("EPUB archive uncompressed size exceeds safety limits.")
 
         names = set(zf.namelist())
         lower_names = {name.lower(): name for name in names}
 
         opf_path = _find_opf(zf)
         opf_dir = posixpath.dirname(opf_path)
-
         manifest, spine, toc_id = _parse_opf(zf, opf_path)
         if not spine:
             raise ValueError("The EPUB contains no readable spine.")
 
-        toc_titles = _parse_toc_titles(
-            zf, opf_dir, manifest, toc_id, names, lower_names
-        )
-
+        toc_titles = _parse_toc_titles(zf, opf_dir, manifest, toc_id, names, lower_names)
         chapters: list[Chapter] = []
         seen_paths: set[str] = set()
-        accumulated_text_bytes = 0
-        total = len(spine)
+        accumulated_bytes = 0
 
-        for index, idref in enumerate(spine, start=1):
+        for idref in spine:
             item = manifest.get(idref)
             if not item:
                 continue
 
-            # Skip standalone EPUB3 nav table-of-contents document
-            props = item.get("properties", "").split()
-            if "nav" in props and len(spine) > 1:
+            if "nav" in item.get("properties", "").split() and len(spine) > 1:
                 continue
 
             media_type = item["media_type"].lower()
             href_lower = item["href"].split("#", 1)[0].lower()
-            is_html = (
+            if not (
                 "html" in media_type
                 or "xhtml" in media_type
                 or href_lower.endswith((".xhtml", ".html", ".htm", ".xml"))
-            )
-            if not is_html:
+            ):
                 continue
 
-            document_path = _resolve_href(
-                item["href"],
-                opf_dir,
-                names,
-                lower_names,
-            )
-            if document_path is None or document_path in seen_paths:
+            doc_path = _resolve_href(item["href"], opf_dir, names, lower_names)
+            if doc_path is None or doc_path in seen_paths:
                 continue
+            seen_paths.add(doc_path)
 
-            seen_paths.add(document_path)
             fallback_title = f"Chapter {len(chapters) + 1}"
-            toc_title = toc_titles.get(document_path)
-
-            if progress_callback:
-                try:
-                    progress_callback(index, total, toc_title or fallback_title)
-                except Exception:
-                    pass
-
             try:
-                raw_html = _safe_zip_read(zf, document_path)
-                title, text = _extract_html_text(
-                    raw_html,
-                    toc_title,
-                    fallback_title,
-                )
+                raw_html = _safe_zip_read(zf, doc_path)
+                title, text = _extract_html_text(raw_html, toc_titles.get(doc_path), fallback_title)
             except Exception as exc:
-                logger.warning("Failed to read EPUB item %s: %s", document_path, exc)
+                logger.warning("Failed to read EPUB item %s: %s", doc_path, exc)
                 continue
 
-            # Keep short chapters/prologues (at least 3 chars of real content), skip empty covers
             stripped = text.strip()
             if len(stripped) < 3:
                 continue
 
-            accumulated_text_bytes += len(stripped.encode("utf-8"))
-            if accumulated_text_bytes > MAX_EPUB_UNCOMPRESSED_BYTES:
+            accumulated_bytes += len(stripped.encode("utf-8"))
+            if accumulated_bytes > MAX_EPUB_UNCOMPRESSED_BYTES:
                 raise ValueError("Book text exceeds maximum supported size.")
 
-            chapters.append(
-                Chapter(
-                    number=len(chapters) + 1,
-                    title=title,
-                    text=stripped,
-                )
-            )
+            chapters.append(Chapter(number=len(chapters) + 1, title=title, text=stripped))
 
         if not chapters:
             raise ValueError("No readable chapters were found in this EPUB.")
@@ -507,12 +362,7 @@ def extract_epub(path: str | Path, progress_callback=None) -> list[Chapter]:
 
 
 def extract_txt(path: str | Path) -> list[Chapter]:
-    """
-    Extract a TXT file into chapters (supports English, Roman numerals, Prologues,
-    and Hindi अध्याय / भाग / खंड headings).
-    """
     path = Path(path)
-
     if not path.exists():
         raise FileNotFoundError("TXT file does not exist.")
 
@@ -521,69 +371,32 @@ def extract_txt(path: str | Path) -> list[Chapter]:
         raise ValueError("The TXT file is empty.")
 
     matches = list(_TXT_CHAPTER_PATTERN.finditer(raw))
-
-    if len(matches) >= 1:
+    if matches:
         chapters: list[Chapter] = []
-
         preamble = _clean_text(raw[: matches[0].start()])
-        if preamble and len(matches) >= 2:
-            chapters.append(
-                Chapter(
-                    number=1,
-                    title="Introduction",
-                    text=preamble,
-                )
-            )
-        elif preamble and len(matches) == 1:
-            # Single chapter heading with preamble before it
-            chapters.append(
-                Chapter(
-                    number=1,
-                    title="Introduction",
-                    text=preamble,
-                )
-            )
+        if preamble:
+            chapters.append(Chapter(number=1, title="Introduction", text=preamble))
 
         for i, match in enumerate(matches):
             start = match.start()
             end = matches[i + 1].start() if i + 1 < len(matches) else len(raw)
-
-            block = raw[start:end].strip()
-            lines = block.splitlines()
-
+            lines = raw[start:end].strip().splitlines()
             title = lines[0].strip() if lines else f"Chapter {i + 1}"
             text = _clean_text("\n".join(lines[1:]))
-
             if text:
-                chapters.append(
-                    Chapter(
-                        number=len(chapters) + 1,
-                        title=title,
-                        text=text,
-                    )
-                )
+                chapters.append(Chapter(number=len(chapters) + 1, title=title, text=text))
 
         if len(chapters) >= 2 or (len(chapters) == 1 and len(matches) == 1 and not preamble):
             return chapters
 
-    return [
-        Chapter(
-            number=1,
-            title=path.stem.replace("_", " ").strip() or "Book",
-            text=raw,
-        )
-    ]
+    return [Chapter(number=1, title=path.stem.replace("_", " ").strip() or "Book", text=raw)]
 
 
-def extract_book(path: str | Path, progress_callback=None) -> list[Chapter]:
-    """Automatically select EPUB or TXT parser."""
+def extract_book(path: str | Path) -> list[Chapter]:
     path = Path(path)
     suffix = path.suffix.lower()
-
     if suffix == ".epub":
-        return extract_epub(path, progress_callback=progress_callback)
-
+        return extract_epub(path)
     if suffix == ".txt":
         return extract_txt(path)
-
     raise ValueError("Supported files are EPUB and TXT.")

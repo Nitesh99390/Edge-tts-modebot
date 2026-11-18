@@ -26,24 +26,23 @@ from modules.textvoice.handler import (
     status_command,
 )
 
+logger = logging.getLogger(__name__)
+
 
 def _setup_logging() -> None:
     level = getattr(logging, LOG_LEVEL, logging.INFO)
     handlers: list[logging.Handler] = [logging.StreamHandler(sys.stdout)]
-
     if LOG_FILE:
         try:
             log_path = Path(LOG_FILE)
             log_path.parent.mkdir(parents=True, exist_ok=True)
-            file_handler = RotatingFileHandler(
-                log_path,
-                maxBytes=5 * 1024 * 1024,  # 5 MB per file
-                backupCount=3,
-                encoding="utf-8",
+            handlers.append(
+                RotatingFileHandler(
+                    log_path, maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8"
+                )
             )
-            handlers.append(file_handler)
-        except OSError as exc:
-            print(f"[Logging] Could not open log file {LOG_FILE}: {exc}", file=sys.stderr)
+        except OSError:
+            pass
 
     logging.basicConfig(
         format="%(asctime)s | %(levelname)-7s | %(name)s | %(message)s",
@@ -55,160 +54,68 @@ def _setup_logging() -> None:
     logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 
-logger = logging.getLogger(__name__)
+def _guard(fn):
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        user = update.effective_user
+        if user is None or user.id not in OWNER_IDS:
+            if update.callback_query:
+                await update.callback_query.answer("This bot is private.", show_alert=True)
+            elif update.effective_message:
+                await update.effective_message.reply_text("🔒 Private bot.")
+            return
+        await fn(update, context)
+
+    return wrapper
 
 
-def is_owner(update: Update) -> bool:
-    user = update.effective_user
-    return user is not None and user.id in OWNER_IDS
-
-
-async def private_notice(update: Update) -> None:
-    message = update.effective_message
-    if message:
-        await message.reply_text(
-            "🔒 This bot is private and can only be used by its authorized owner."
+@_guard
+async def start(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_message:
+        await update.effective_message.reply_text(
+            "⚡ ModuBot Text-to-Voice (Turbo Edition)\n\n"
+            "Send an EPUB or TXT book directly, or use:\n"
+            "• /textvoice — Start a new audiobook\n"
+            "• /status — Check server & job status\n"
+            "• /cancel — Stop active conversion\n"
+            "• /help — Quick guide"
         )
 
 
-async def start(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-) -> None:
-    if not is_owner(update):
-        await private_notice(update)
-        return
-
-    message = update.effective_message
-    if not message:
-        return
-
-    await message.reply_text(
-        "🎙️ Welcome to ModuBot Text-to-Voice (Oracle Server Edition)!\n\n"
-        "Send an EPUB or TXT novel directly, or use:\n"
-        "• /textvoice — Start a new audiobook session\n"
-        "• /status — Check Oracle server & job status\n"
-        "• /cancel — Stop an active audiobook conversion\n"
-        "• /help — Usage tips & supported voices"
-    )
+@_guard
+async def help_command(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_message:
+        await update.effective_message.reply_text(
+            "📖 Quick Guide:\n\n"
+            "1. Send any .epub or .txt file (up to 20 MB).\n"
+            "2. Choose Entire Book or Chapter Range (e.g. 1-5).\n"
+            "3. Choose Language (English / Hindi-Hinglish), Voice, Style & Speed.\n"
+            "4. Turbo Worker Pool converts ~4 hours of audio in ~3 minutes and "
+            "uploads MP3 parts (<45 MB each) automatically."
+        )
 
 
-async def help_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-) -> None:
-    if not is_owner(update):
-        await private_notice(update)
-        return
-
-    message = update.effective_message
-    if not message:
-        return
-
-    await message.reply_text(
-        "📖 How to Convert a Book to Audio:\n\n"
-        "1. Send any .epub or .txt file (up to 20 MB).\n"
-        "2. Pick Entire Book or a Chapter Range (e.g. 1-5).\n"
-        "3. Select Language (English or Hindi/Hinglish).\n"
-        "4. Select Voice, Speaking Style, and Speed.\n"
-        "5. Wait while the server converts and uploads MP3 part(s) (automatically split under 45 MB for long novels).\n\n"
-        "Commands:\n"
-        "• /textvoice — Reset & start fresh\n"
-        "• /status — Check server disk, FFmpeg & active progress\n"
-        "• /cancel — Immediately cancel a running conversion"
-    )
-
-
-async def textvoice_router(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-) -> None:
-    if not is_owner(update):
-        await private_notice(update)
-        return
-    await enter(update, context)
-
-
-async def cancel_router(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-) -> None:
-    if not is_owner(update):
-        await private_notice(update)
-        return
-    await cancel_command(update, context)
-
-
-async def status_router(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-) -> None:
-    if not is_owner(update):
-        await private_notice(update)
-        return
-    await status_command(update, context)
-
-
-async def document_router(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-) -> None:
-    if not is_owner(update):
-        await private_notice(update)
-        return
-    await handle_document(update, context)
-
-
-async def text_router(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-) -> None:
-    if not is_owner(update):
-        await private_notice(update)
-        return
-    await handle_text(update, context)
-
-
-async def callback_router(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-) -> None:
-    if not is_owner(update):
-        query = update.callback_query
-        if query:
-            await query.answer("This bot is private.", show_alert=True)
-        return
-    await callback(update, context)
-
-
-async def error_handler(
-    update: object,
-    context: ContextTypes.DEFAULT_TYPE,
-) -> None:
-    """Global error handler so transient Telegram polling hiccups never crash the daemon."""
+async def error_handler(_update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.error("Unhandled update exception: %s", context.error, exc_info=context.error)
 
 
 async def _post_init(application: Application) -> None:
-    """Register bot commands in Telegram's menu automatically on startup."""
     try:
         await application.bot.set_my_commands(
             [
                 BotCommand("start", "Welcome & overview"),
-                BotCommand("textvoice", "Start converting an EPUB/TXT novel"),
-                BotCommand("status", "Check Oracle server & conversion status"),
+                BotCommand("textvoice", "Convert EPUB/TXT novel to audio"),
+                BotCommand("status", "Server & conversion status"),
                 BotCommand("cancel", "Cancel active conversion"),
-                BotCommand("help", "Usage instructions"),
+                BotCommand("help", "Quick usage guide"),
             ]
         )
     except Exception as exc:
-        logger.warning("Could not register bot menu commands: %s", exc)
+        logger.warning("Could not set bot menu commands: %s", exc)
 
 
 async def _post_shutdown(_application: Application) -> None:
-    """Clean temporary directories on graceful server stop/restart."""
     cleanup_stale_jobs()
-    logger.info("Bot shut down cleanly and temporary directories were purged.")
+    logger.info("Bot stopped cleanly.")
 
 
 def main() -> None:
@@ -232,21 +139,18 @@ def main() -> None:
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("textvoice", textvoice_router))
-    application.add_handler(CommandHandler("cancel", cancel_router))
-    application.add_handler(CommandHandler("status", status_router))
-    application.add_handler(CallbackQueryHandler(callback_router))
-    application.add_handler(MessageHandler(filters.Document.ALL, document_router))
+    application.add_handler(CommandHandler("textvoice", _guard(enter)))
+    application.add_handler(CommandHandler("cancel", _guard(cancel_command)))
+    application.add_handler(CommandHandler("status", _guard(status_command)))
+    application.add_handler(CallbackQueryHandler(_guard(callback)))
+    application.add_handler(MessageHandler(filters.Document.ALL, _guard(handle_document)))
     application.add_handler(
-        MessageHandler(filters.TEXT & ~filters.COMMAND, text_router)
+        MessageHandler(filters.TEXT & ~filters.COMMAND, _guard(handle_text))
     )
     application.add_error_handler(error_handler)
 
-    logger.info("ModuBot TTS Novel (Oracle Server Edition) starting polling...")
-    application.run_polling(
-        drop_pending_updates=True,
-        allowed_updates=Update.ALL_TYPES,
-    )
+    logger.info("ModuBot Turbo TTS starting polling...")
+    application.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
 
 
 if __name__ == "__main__":
